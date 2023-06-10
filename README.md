@@ -17,3 +17,6 @@ It uses MacOS's inbuilt `sandbox-exec` command to work, as sandbox-exec is a ful
 
 Run the command:
 `sandbox-exec -f Path/To/The/Sandbox/Profile/minecraft-sandbox.sb /Applications/Minecraft.app/Contents/MacOS/launcher`
+
+
+*Note: This project is still in development and may not function as it should, some extra files may still be given access to Minecraft which will be removed in future versions. Be vary of this before using this project.*
