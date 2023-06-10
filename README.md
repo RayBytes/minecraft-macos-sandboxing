@@ -7,7 +7,7 @@ This repository contains a sandbox-exec profile for MacOS to completely [sandbox
 
 # Why was this created?
 
-As many have may of heard, recently the [Fractureiser](https://github.com/fractureiser-investigation/fractureiser/) virus has been spread all accorss modding sites, causing havoc in the modding community. This has shown the true abilitiy and reach of mods and how badly their ability of aribtrary code execution can be exploited. Due to this virus, the community as a whole has begun finding ways to limit the affect of possible future minecraft-mod based malware. While Fractureiser did not target MacOS, this likely will not happen in future malware, and so conseqently it was neccesary to find a way to make sure MacOS is completely or at least, as safe as possible, from these mods.
+As many may of heard, recently the [Fractureiser](https://github.com/fractureiser-investigation/fractureiser/) virus has been spread all accorss modding sites, causing havoc in the modding community. This has shown the true abilitiy and reach of mods and how badly their ability of aribtrary code execution can be exploited. Due to this virus, the community as a whole has begun finding ways to limit the affect of possible future minecraft-mod based malware. While Fractureiser did not target MacOS, this likely will not happen in future malware, and so conseqently it was neccesary to find a way to make sure MacOS is completely or at least, as safe as possible, from these mods.
 
 # How does it work?
 
