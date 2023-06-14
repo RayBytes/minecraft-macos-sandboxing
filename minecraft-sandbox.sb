@@ -16,20 +16,20 @@
   (subpath "/Applications/Minecraft.app/")
   (subpath "/Applications/Minecraft.app/Contents/MacOS/launcher")
   (regex "/Library/Keychains/*")
-  (regex "^$HOME/Library/Saved Application State/net\.java\w*")
-  (subpath "$HOME/Library/Application Support/CEF/User Data/WidevineCdm/")
-  (subpath "$HOME/Library/Fonts/")
+  (regex "^/Users/rayanalikhan/Library/Saved Application State/net\.java\w*")
+  (subpath "/Users/rayanalikhan/Library/Application Support/CEF/User Data/WidevineCdm/")
+  (subpath "/Users/rayanalikhan/Library/Fonts/")
   (subpath "/private/var/folders/")
 )
 
 (allow file-issue-extension 
   (extension-class "com.apple.app-sandbox.read") 
-  (literal "$HOME/Library/Application Support/minecraft/launcher/launcher.bundle/Contents/Frameworks/launcher-Helper.app")
+  (literal "/Users/rayanalikhan/Library/Application Support/minecraft/launcher/launcher.bundle/Contents/Frameworks/launcher-Helper.app")
   )
 
 (allow file-read-data
   (subpath "/private/etc/hosts")
-  (subpath "$HOME/Library/Application Support/minecraft")
+  (subpath "/Users/rayanalikhan/Library/Application Support/minecraft")
 )
 
 (allow mach-lookup 
@@ -50,9 +50,9 @@
 
 ; Allow access to user inpt data
 (allow file-read-data
-  (subpath "$HOME/Library/Spelling")
-  (subpath "$HOME/Library/Input Methods")
-  (subpath "$HOME/Library/Keyboard Layouts")
+  (subpath "/Users/rayanalikhan/Library/Spelling")
+  (subpath "/Users/rayanalikhan/Library/Input Methods")
+  (subpath "/Users/rayanalikhan/Library/Keyboard Layouts")
 )
 
 (allow user-preference-read 
@@ -95,11 +95,11 @@
   (subpath "/private/var/db/searchparty/sharedVault/agents/78BFBE72-7C54-4571-8D1B-5F58D809AA3B/savedConfiguration.plist")
   (subpath "/Library/Preferences/com.apple.networkd.plist")
   (subpath "/private/var/db/searchparty/sharedVault/BeaconPayloadCache/")
-  (subpath "$HOME/Library/Preferences/com.apple.security.plist")
+  (subpath "/Users/rayanalikhan/Library/Preferences/com.apple.security.plist")
 )
 
 (allow file-read-data file-write-unlink
-  (subpath "$HOME/Library/Application Support/CEF/User Data/WidevineCdm/")
+  (subpath "/Users/rayanalikhan/Library/Application Support/CEF/User Data/WidevineCdm/")
 )           
 
 ; Allow access to Rosetta runtime
@@ -145,4 +145,3 @@
 (allow file-read* (subpath "/Library/Audio/Plug-Ins"))
 
 (allow device-microphone)
-
