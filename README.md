@@ -24,7 +24,7 @@ A python application has been created to patch in the $HOME directory to where i
 
 ## How to run the patcher?
 
-python patcher.py --dir=/path/to/sandbox/profile.sb --user-patch
+`python patcher.py --dir=/path/to/sandbox/profile.sb --user-patch`
 
 # Launchers
 
