@@ -9,4 +9,4 @@ Here are the commands for the below current supported launchers
 
 # Reminder
 
-All launcher profiles will likely need to be patched with the (patcher)[/patcher.py]
+All launcher profiles will likely need to be patched with the (patcher)[patcher.py]
