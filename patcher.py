@@ -13,9 +13,9 @@ if args_dict['--dir']:
     if os.path.isfile(args_dict['--dir']) & args_dict['--dir'].endswith('.sb'):
         sandbox_file = args_dict['--dir']
 else:
-    raise Exception('A --dir argument must be used to use --version')
+    raise Exception('A --dir argument must be there to use --user-patch')
 
-if args_dict['--version']:
+if args_dict['--user-patch']:
     with open(sandbox_file, 'r') as file:
         data = file.readlines()
     for line in data:
