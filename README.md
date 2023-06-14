@@ -22,6 +22,10 @@ Run the command:
 
 A python application has been created to patch in the $HOME directory to where it needs to be for your system. Since the username of the computer changes per-system and since some file paths need to know the username, this patcher has been made. You do not need to run the patcher for minecraft version 1.6< and up, however any versions lower you will need to run the patcher. Any files in the launchers section will by default also need to run the patcher.
 
+## How to run the patcher?
+
+python patcher.py --dir=/path/to/sandbox/profile.sb --user-patch
+
 # Launchers
 
 If you want to sandbox a **launcher**, then look at the launchers folder in the repository. Here you will find any and all common launchers. If a launcher isn't there, create a issue and it will be added.
