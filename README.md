@@ -18,5 +18,13 @@ It uses MacOS's inbuilt `sandbox-exec` command to work, as sandbox-exec is a ful
 Run the command:
 `sandbox-exec -f Path/To/The/Sandbox/Profile/minecraft-sandbox.sb /Applications/Minecraft.app/Contents/MacOS/launcher`
 
+# Patcher
+
+A python application has been created to patch in the $HOME directory to where it needs to be for your system. Since the username of the computer changes per-system and since some file paths need to know the username, this patcher has been made. You do not need to run the patcher for minecraft version 1.6< and up, however any versions lower you will need to run the patcher. Any files in the launchers section will by default also need to run the patcher.
+
+# Launchers
+
+If you want to sandbox a **launcher**, then look at the launchers folder in the repository. Here you will find any and all common launchers. If a launcher isn't there, create a issue and it will be added.
+
 
 *Note: This project is still in development and may not function as it should, some extra files may still be given access to Minecraft which will be removed in future versions. Be vary of this before using this project.*
