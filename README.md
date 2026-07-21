@@ -1,26 +1,75 @@
 # minecraft-macos-sandboxing
 
-*Documentation in progress*
+Sandboxing for modded Minecraft on macOS using Prism Launcher.
 
-# What is this?
-This repository contains a sandbox-exec profile for MacOS to completely [sandbox](https://en.wikipedia.org/wiki/Sandbox_(computer_security)) Minecraft. This will disable minecraft from accessing any harmful data which it could gain access to without this profile. The profile will* only give access to files which minecraft needs to run.
+## What is this?
 
-# Why was this created?
+This project runs Minecraft through macOS `sandbox-exec`. It limits which files
+mods can access and keeps the Minecraft access token outside the Java process.
 
-As many may of heard, recently the [Fractureiser](https://github.com/fractureiser-investigation/fractureiser/) virus has been spread all accross modding sites, causing havoc in the modding community. This has shown the true abilitiy and reach of mods and how badly their ability of aribtrary code execution can be exploited. Due to this virus, the community as a whole has begun finding ways to limit the affect of possible future minecraft-mod based malware. While Fractureiser did not target MacOS, this likely will not happen in future malware, and so conseqently it was neccesary to find a way to make sure MacOS is completely or at least, as safe as possible, from these mods.
+Integration is provided through Prism's wrapper command.
 
-# How does it work?
+Currently, only Prism Launcher & other MultiMC Launchers may work. Support for more launchers may be added in the future.
 
-It uses MacOS's inbuilt `sandbox-exec` command to work, as sandbox-exec is a fully native-to-MacOS way to securely sandbox apps.
+## How does it work?
 
-# Usage
+The wrapper removes the access token from Minecraft's launch arguments and gives
+Java a placeholder token. A small native broker holds the real token and handles
+the requests needed to join online servers.
 
-Run the command:
-`sandbox-exec -f Path/To/The/Sandbox/Profile/minecraft-sandbox.sb /Applications/Minecraft.app/Contents/MacOS/launcher`
+A Java agent redirects Mojang authlib's server join and profile certificate
+requests to the broker. The modded JVM only has access to these limited requests.
 
-# Launchers
+The sandbox allows Minecraft to access its instance, Java runtime, Prism
+libraries, temporary files, graphics, audio, and the network. It blocks Prism
+account files, browser data, SSH keys, Keychain files, and other common private
+data.
 
-If you want to sandbox a **launcher**, then look at the launchers folder in the repository. Here you will find any and all common launchers. If a launcher isn't there, create a issue and it will be added.
+## Requirements
 
+- macOS
+- Prism Launcher
+- Java 17 or newer
+- Xcode Command Line Tools
 
-*Note: This project is still in development and may not function as it should, some extra files may still be given access to Minecraft which will be removed in future versions. Be vary of this before using this project.*
+## Installation
+
+Close Prism Launcher and run:
+
+```sh
+./bin/install-prism-wrapper
+```
+
+Open Prism and launch Minecraft normally.
+
+To remove the wrapper, close Prism and run:
+
+```sh
+./bin/install-prism-wrapper --uninstall
+```
+
+## Optional permissions
+
+These can be added to Prism's global environment settings when needed:
+
+```text
+MC_SANDBOX_MICROPHONE=1
+MC_SANDBOX_DISCORD=1
+MC_SANDBOX_STEAM=1
+```
+
+## Limitations
+
+A malicious mod still controls the running game. It can read Minecraft data,
+send chat messages, change gameplay, and access files inside the instance.
+
+There may still be errors around, & mods which modify the game significantly/require things in the filesystem make break.
+
+While the game is running, a mod can ask the broker to authenticate multiplayer
+connections. This could be used to join another server as the account during that
+launch. The broker limits the number of requests and stops when Minecraft exits. This still provides a higher level of security which a malicious developer would need to design around, however we do need to improve this.
+
+Modern Minecraft also places a temporary chat signing key inside Java. A mod can
+copy and misuse that key until it expires.
+
+`sandbox-exec` is deprecated by Apple and may change in future macOS releases.

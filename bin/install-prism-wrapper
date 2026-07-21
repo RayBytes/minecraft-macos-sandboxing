@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WRAPPER = ROOT / "build" / "mcguard-entry"
+DEFAULT_CONFIG = Path.home() / "Library" / "Application Support" / "PrismLauncher" / "prismlauncher.cfg"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Install or remove the Prism Launcher Minecraft sandbox wrapper.")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to prismlauncher.cfg")
+    parser.add_argument("--uninstall", action="store_true", help="Clear WrapperCommand if it points to this wrapper")
+    return parser.parse_args()
+
+
+def set_key(lines: list[str], key: str, value: str) -> list[str]:
+    target = f"{key}="
+    replaced = False
+    out = []
+    in_general = False
+    for line in lines:
+        stripped = line.rstrip("\n")
+        if stripped == "[General]":
+            in_general = True
+        elif stripped.startswith("[") and stripped.endswith("]"):
+            if in_general and not replaced:
+                out.append(f"{key}={value}\n")
+                replaced = True
+            in_general = False
+
+        if in_general and stripped.startswith(target):
+            out.append(f"{key}={value}\n")
+            replaced = True
+        else:
+            out.append(line)
+
+    if not replaced:
+        if not any(line.rstrip("\n") == "[General]" for line in out):
+            out.insert(0, "[General]\n")
+        out.append(f"{key}={value}\n")
+    return out
+
+
+def main() -> int:
+    args = parse_args()
+    config = Path(args.config).expanduser()
+    if not config.exists():
+        print(f"Prism config not found: {config}")
+        print("Open Prism once, close it, then run this installer again.")
+        return 1
+
+    current = config.read_text(encoding="utf-8").splitlines(keepends=True)
+    if not args.uninstall:
+        print("Building MCGuard broker and Java agent...")
+        try:
+            subprocess.run(["make", "all"], cwd=ROOT, check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"Could not build MCGuard components: {exc}")
+            return 1
+    value = "" if args.uninstall else str(WRAPPER)
+
+    backup = config.with_suffix(config.suffix + "." + datetime.now().strftime("%Y%m%d-%H%M%S") + ".bak")
+    shutil.copy2(config, backup)
+    config.write_text("".join(set_key(current, "WrapperCommand", value)), encoding="utf-8")
+
+    if args.uninstall:
+        print(f"Removed Prism WrapperCommand. Backup: {backup}")
+    else:
+        print(f"Installed Prism WrapperCommand={WRAPPER}")
+        print(f"Backup: {backup}")
+        print("You can now open Prism normally. Minecraft instances will launch inside the sandbox.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

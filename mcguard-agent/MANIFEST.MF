@@ -1,0 +1,5 @@
+Manifest-Version: 1.0
+Premain-Class: dev.rayan.mcguard.Agent
+Boot-Class-Path: mcguard-agent.jar
+Can-Redefine-Classes: false
+Can-Retransform-Classes: false

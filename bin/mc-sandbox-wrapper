@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+BROKER = ROOT / "build" / "mcguard-broker"
+AGENT = ROOT / "build" / "mcguard-agent.jar"
+PLACEHOLDER_TOKEN = "MCGUARD-NO-REUSABLE-TOKEN"
+PRISM_ENTRYPOINT = "org.prismlauncher.EntryPoint"
+MAX_PRISM_PROTOCOL = 12 * 1024
+
+
+def q(value: str) -> str:
+    return json.dumps(value)
+
+
+def real(path: str | Path) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+def existing_real(path: str | Path) -> str:
+    p = Path(path).expanduser()
+    try:
+        return str(p.resolve())
+    except FileNotFoundError:
+        return str(p.absolute())
+
+
+def subpath(path: str) -> str:
+    return f"(subpath {q(path)})"
+
+
+def literal(path: str) -> str:
+    return f"(literal {q(path)})"
+
+
+def path_filters(paths: list[str], kind: str = "subpath") -> str:
+    out = []
+    seen = set()
+    for raw in paths:
+        if not raw:
+            continue
+        path = existing_real(raw)
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(f"  {literal(path) if kind == 'literal' else subpath(path)}")
+    return "\n".join(out)
+
+
+def trace(message: str) -> None:
+    log_path = Path.home() / ".lunarclient" / "logs" / "mc-sandbox-wrapper.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{message}\n")
+    except OSError:
+        pass
+
+
+def sanitized_environment() -> dict[str, str]:
+    blocked_exact = {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GIT_ASKPASS",
+        "GNUPGHOME",
+        "GPG_AGENT_INFO",
+        "HOMEBREW_GITHUB_API_TOKEN",
+        "NPM_TOKEN",
+        "OPENAI_API_KEY",
+        "PYPI_TOKEN",
+        "SSH_AGENT_PID",
+        "SSH_AUTH_SOCK",
+    }
+    blocked_fragments = (
+        "ACCESS_TOKEN",
+        "API_KEY",
+        "AUTH_TOKEN",
+        "CREDENTIAL",
+        "PASSWORD",
+        "PRIVATE_KEY",
+        "SECRET",
+    )
+    blocked_prefixes = (
+        "DYLD_",
+        "LD_",
+        "PYTHON",
+    )
+    blocked_loader_and_transport = {
+        "_JAVA_OPTIONS",
+        "ALL_PROXY",
+        "BASH_ENV",
+        "CLASSPATH",
+        "CURL_CA_BUNDLE",
+        "CURL_HOME",
+        "ENV",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "NETRC",
+        "NODE_OPTIONS",
+        "NO_PROXY",
+        "PERL5OPT",
+        "RUBYOPT",
+        "SSLKEYLOGFILE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "ZDOTDIR",
+    }
+    clean: dict[str, str] = {}
+    for key, value in os.environ.items():
+        upper = key.upper()
+        if (upper in blocked_exact or upper in blocked_loader_and_transport
+                or any(upper.startswith(prefix) for prefix in blocked_prefixes)
+                or any(fragment in upper for fragment in blocked_fragments)):
+            continue
+        clean[key] = value
+    return clean
+
+
+def java_home(java_bin: str) -> str:
+    path = Path(java_bin).expanduser()
+    parts = path.parts
+    if len(parts) >= 3 and parts[-2:] == ("bin", "java"):
+        return str(path.parent.parent.resolve())
+    return str(path.parent.resolve())
+
+
+def read_prism_key(path: Path, key: str) -> str:
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        return ""
+    return ""
+
+
+def installed_java_candidates() -> list[str]:
+    roots = [
+        Path.home() / "Library" / "Java" / "JavaVirtualMachines",
+        Path("/Library/Java/JavaVirtualMachines"),
+    ]
+    found: list[str] = []
+    for root in roots:
+        found.extend(str(path) for path in sorted(root.glob("*/Contents/Home/bin/java")) if path.is_file())
+    return found
+
+
+def best_installed_java() -> str:
+    inst_dir = os.environ.get("INST_DIR", "")
+    wanted_version = read_prism_key(Path(inst_dir) / "instance.cfg", "JavaVersion") if inst_dir else ""
+    candidates = installed_java_candidates()
+    if wanted_version:
+        for candidate in candidates:
+            if wanted_version in candidate:
+                return real(candidate)
+
+    env_home = os.environ.get("JAVA_HOME", "")
+    if env_home:
+        candidate = Path(env_home) / "bin" / "java"
+        if candidate.is_file():
+            return real(candidate)
+
+    for candidate in candidates:
+        return real(candidate)
+    return ""
+
+
+def usable_java(path: str) -> str:
+    if not path:
+        return ""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        return ""
+    if candidate.is_file():
+        return real(candidate)
+    return ""
+
+
+def resolve_java_command(argv: list[str]) -> list[str]:
+    command = argv[:]
+    java_arg = command[0]
+    inst_java = os.environ.get("INST_JAVA", "")
+    override_java = os.environ.get("MC_SANDBOX_JAVA", "")
+
+    should_prefer_inst_java = (
+        java_arg == "java"
+        or java_arg.endswith("/usr/bin/java")
+        or java_arg == "/usr/bin/java"
+        or not Path(java_arg).is_absolute()
+    )
+    if should_prefer_inst_java:
+        resolved = usable_java(override_java) or usable_java(inst_java) or best_installed_java()
+        if resolved:
+            command[0] = resolved
+    elif not Path(java_arg).is_absolute():
+        found = shutil.which(java_arg)
+        if found:
+            command[0] = real(found)
+
+    return command
+
+
+def classpath_roots(command: list[str]) -> list[str]:
+    roots: list[str] = []
+    flags_with_value = {"-cp", "-classpath", "--class-path", "-p", "--module-path", "--upgrade-module-path"}
+    for index, arg in enumerate(command[1:], start=1):
+        value = ""
+        if arg in flags_with_value and index + 1 < len(command):
+            value = command[index + 1]
+        elif arg.startswith("--class-path=") or arg.startswith("--module-path=") or arg.startswith("--upgrade-module-path="):
+            value = arg.split("=", 1)[1]
+        elif arg.startswith("-Djava.library.path="):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+
+        for entry in value.split(os.pathsep):
+            if not entry:
+                continue
+            path = Path(entry).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            if path.is_file():
+                roots.append(str(path.parent))
+            else:
+                roots.append(str(path))
+    return roots
+
+
+def arg_value(command: list[str], name: str) -> str:
+    for index, arg in enumerate(command):
+        if arg == name and index + 1 < len(command):
+            return command[index + 1]
+        if arg.startswith(f"{name}="):
+            return arg.split("=", 1)[1]
+    return ""
+
+
+def system_property(command: list[str], name: str) -> str:
+    prefix = f"-D{name}="
+    for arg in command:
+        if arg.startswith(prefix):
+            return arg.split("=", 1)[1]
+    return ""
+
+
+def extract_unique_arg(command: list[str], name: str) -> tuple[str, int, bool]:
+    matches: list[tuple[str, int, bool]] = []
+    for index, arg in enumerate(command):
+        if arg == name:
+            if index + 1 >= len(command):
+                raise SystemExit(f"mc-sandbox-wrapper: {name} is missing its value; secure launch refused.")
+            matches.append((command[index + 1], index + 1, False))
+        elif arg.startswith(f"{name}="):
+            matches.append((arg.split("=", 1)[1], index, True))
+    if len(matches) != 1:
+        raise SystemExit(
+            f"mc-sandbox-wrapper: expected exactly one {name} argument, found {len(matches)}; secure launch refused."
+        )
+    return matches[0]
+
+
+def protect_command(command: list[str]) -> tuple[list[str], str, str]:
+    protected = command[:]
+    token, token_index, token_inline = extract_unique_arg(command, "--accessToken")
+    profile_uuid, _, _ = extract_unique_arg(command, "--uuid")
+    if not token or token == PLACEHOLDER_TOKEN or token.startswith("${"):
+        raise SystemExit("mc-sandbox-wrapper: Prism did not provide a usable access token; secure launch refused.")
+    normalized_uuid = profile_uuid.replace("-", "")
+    if len(normalized_uuid) != 32 or any(character not in "0123456789abcdefABCDEF" for character in normalized_uuid):
+        raise SystemExit("mc-sandbox-wrapper: Prism provided an invalid profile UUID; secure launch refused.")
+    if token_inline:
+        protected[token_index] = f"--accessToken={PLACEHOLDER_TOKEN}"
+    else:
+        protected[token_index] = PLACEHOLDER_TOKEN
+    return protected, token, profile_uuid
+
+
+def is_prism_bootstrap(command: list[str]) -> bool:
+    return PRISM_ENTRYPOINT in command and any("NewLaunch.jar" in arg for arg in command)
+
+
+def looks_like_direct_game(command: list[str]) -> bool:
+    markers = {
+        "--accessToken",
+        "--gameDir",
+        "net.minecraft.client.main.Main",
+        "net.minecraft.client.Minecraft",
+    }
+    return any(arg in markers or arg.startswith("--accessToken=") or arg.startswith("--gameDir=") for arg in command)
+
+
+def protect_prism_protocol(stream) -> tuple[bytes, str, str]:
+    lines: list[bytes] = []
+    total = 0
+    while True:
+        line = stream.readline(MAX_PRISM_PROTOCOL + 1)
+        if not line:
+            raise SystemExit("mc-sandbox-wrapper: Prism closed its launch protocol before 'launch'; secure launch refused.")
+        total += len(line)
+        if total > MAX_PRISM_PROTOCOL or len(line) > MAX_PRISM_PROTOCOL:
+            raise SystemExit("mc-sandbox-wrapper: Prism launch protocol is unexpectedly large; secure launch refused.")
+        if b"\0" in line or not line.endswith(b"\n"):
+            raise SystemExit("mc-sandbox-wrapper: malformed Prism launch protocol; secure launch refused.")
+        lines.append(line)
+        action = line.rstrip(b"\r\n")
+        if action == b"abort":
+            raise SystemExit("mc-sandbox-wrapper: Prism aborted the launch before credentials were provided.")
+        if action == b"launch":
+            break
+
+    token_matches: list[tuple[int, bytes]] = []
+    uuid_matches: list[bytes] = []
+    index = 0
+    while index < len(lines):
+        content = lines[index].rstrip(b"\r\n")
+        if content == b"param --accessToken" or content == b"param --uuid":
+            if index + 1 >= len(lines):
+                raise SystemExit("mc-sandbox-wrapper: incomplete Prism game argument; secure launch refused.")
+            value_line = lines[index + 1].rstrip(b"\r\n")
+            if not value_line.startswith(b"param "):
+                raise SystemExit("mc-sandbox-wrapper: malformed Prism game argument; secure launch refused.")
+            value = value_line[len(b"param "):]
+            if content == b"param --accessToken":
+                token_matches.append((index + 1, value))
+            else:
+                uuid_matches.append(value)
+            index += 2
+            continue
+        if content.startswith(b"param --accessToken="):
+            token_matches.append((index, content.split(b"=", 1)[1]))
+        elif content.startswith(b"param --uuid="):
+            uuid_matches.append(content.split(b"=", 1)[1])
+        index += 1
+
+    if len(token_matches) != 1 or len(uuid_matches) != 1:
+        raise SystemExit(
+            "mc-sandbox-wrapper: expected exactly one access token and profile UUID in Prism's launch protocol; "
+            f"found {len(token_matches)} token(s) and {len(uuid_matches)} UUID(s); secure launch refused."
+        )
+    try:
+        token = token_matches[0][1].decode("utf-8", errors="strict")
+        profile_uuid = uuid_matches[0].decode("ascii", errors="strict")
+    except UnicodeError as exc:
+        raise SystemExit("mc-sandbox-wrapper: invalid credential encoding in Prism protocol; secure launch refused.") from exc
+    if not token or token == PLACEHOLDER_TOKEN or token.startswith("${"):
+        raise SystemExit("mc-sandbox-wrapper: Prism did not provide a usable access token; secure launch refused.")
+    normalized_uuid = profile_uuid.replace("-", "")
+    if len(normalized_uuid) != 32 or any(character not in "0123456789abcdefABCDEF" for character in normalized_uuid):
+        raise SystemExit("mc-sandbox-wrapper: Prism provided an invalid profile UUID; secure launch refused.")
+
+    token_index, _ = token_matches[0]
+    original = lines[token_index].rstrip(b"\r\n")
+    if original.startswith(b"param --accessToken="):
+        lines[token_index] = b"param --accessToken=" + PLACEHOLDER_TOKEN.encode("ascii") + b"\n"
+    else:
+        lines[token_index] = b"param " + PLACEHOLDER_TOKEN.encode("ascii") + b"\n"
+    return b"".join(lines), token, profile_uuid
+
+
+def trusted_component(path: Path, label: str) -> str:
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise SystemExit(f"mc-sandbox-wrapper: missing {label} at {path}; run `make all`. ({exc})") from exc
+    if not path.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise SystemExit(f"mc-sandbox-wrapper: unsafe ownership or permissions on {label}: {path}")
+    return real(path)
+
+
+def prism_app_roots() -> list[str]:
+    return [
+        path for path in [
+            "/Applications/Prism Launcher.app",
+            "/Applications/PrismLauncher.app",
+        ] if Path(path).exists()
+    ]
+
+
+def inferred_game_dir(command: list[str]) -> str:
+    game_dir = arg_value(command, "--gameDir")
+    if game_dir:
+        return real(game_dir)
+
+    cwd = Path.cwd()
+    if (cwd / "options.txt").exists() or (cwd / "mods").exists() or cwd.name == ".minecraft":
+        return real(cwd)
+
+    return ""
+
+
+def inferred_lunar_game_dir(command: list[str]) -> str:
+    logs_file = system_property(command, "ichor.logsFile")
+    if logs_file:
+        path = Path(logs_file).expanduser()
+        try:
+            profile_root = path.parent.parent
+            if ".lunarclient" in profile_root.parts:
+                return str(Path.home() / "Library" / "Application Support" / "minecraft")
+        except IndexError:
+            pass
+    return ""
+
+
+def inferred_instance_dir(game_dir: str) -> str:
+    if not game_dir:
+        return ""
+    path = Path(game_dir)
+    if path.name == ".minecraft" and path.parent.exists():
+        return real(path.parent)
+    return real(path)
+
+
+def lunar_roots(game_dir: str) -> list[str]:
+    roots = [
+        Path.home() / ".lunarclient",
+        Path.home() / "Library" / "Application Support" / "lunarclient",
+    ]
+    if game_dir:
+        path = Path(game_dir)
+        for parent in [path, *path.parents]:
+            if parent.name == ".lunarclient":
+                roots.append(parent)
+                break
+    return [str(path) for path in roots if path.exists()]
+
+
+def lunar_write_roots(command: list[str]) -> list[str]:
+    roots: list[str] = []
+
+    logs_file = system_property(command, "ichor.logsFile")
+    if logs_file:
+        logs_path = Path(logs_file).expanduser()
+        roots.append(str(logs_path.parent))
+        try:
+            roots.append(str(logs_path.parent.parent))
+        except IndexError:
+            pass
+
+    mods_path = system_property(command, "ichor.fabric.localModPath")
+    if mods_path:
+        path = Path(mods_path).expanduser()
+        roots.append(str(path))
+        try:
+            roots.append(str(path.parent))
+        except IndexError:
+            pass
+
+    for path in [
+        Path.home() / ".lunarclient" / "cache",
+        Path.home() / ".lunarclient" / "jit",
+        Path.home() / ".lunarclient" / "logs",
+        Path.home() / ".lunarclient" / "mx-cache",
+        Path.home() / ".lunarclient" / "offline" / "multiver",
+        Path.home() / ".lunarclient" / "settings" / "game",
+    ]:
+        roots.append(str(path))
+
+    return roots
+
+
+def profile_for(command: list[str]) -> str:
+    env = os.environ
+    java_bin = command[0]
+    inst_dir = env.get("INST_DIR")
+    inst_mc_dir = env.get("INST_MC_DIR") or inferred_game_dir(command) or inferred_lunar_game_dir(command)
+    if not inst_dir:
+        inst_dir = inferred_instance_dir(inst_mc_dir)
+    if not inst_dir:
+        raise SystemExit("mc-sandbox-wrapper: could not infer the game directory; configure this as a Minecraft Java wrapper command.")
+
+    inst_dir = real(inst_dir)
+    inst_mc_dir = real(inst_mc_dir or inst_dir)
+    prism_root = real(Path(inst_dir).parent.parent) if "PrismLauncher" in inst_dir else ""
+    jhome = java_home(java_bin)
+    tmpdir = real(env.get("TMPDIR", "/tmp"))
+    cache_dir = real(env.get("DARWIN_USER_CACHE_DIR", str(Path.home() / "Library" / "Caches")))
+
+    read_write = [
+        inst_dir,
+        inst_mc_dir,
+        tmpdir,
+        cache_dir,
+        *lunar_write_roots(command),
+    ]
+    read_only = [
+        jhome,
+        *([f"{prism_root}/assets", f"{prism_root}/libraries", f"{prism_root}/meta", f"{prism_root}/icons"] if prism_root else []),
+        *lunar_roots(inst_mc_dir),
+        *prism_app_roots(),
+        *classpath_roots(command),
+        "/System",
+        "/usr/lib",
+        "/usr/share",
+        "/System/Library/Audio/Plug-Ins",
+        "/Library/Fonts",
+        "/Library/Apple/Audio/Plug-Ins",
+        str(Path.home() / "Library" / "Fonts"),
+        "/Library/Audio/Plug-Ins",
+        str(Path.home() / "Library" / "Audio"),
+        "/Library/ColorSync/Profiles",
+        "/Library/GPUBundles",
+        "/private/var/db/CVMS",
+        "/private/etc/hosts",
+    ]
+    exec_paths = [
+        f"{jhome}/bin",
+        f"{jhome}/lib",
+    ]
+    agent_path = trusted_component(AGENT, "MCGuard Java agent")
+    broker_path = trusted_component(BROKER, "MCGuard broker")
+
+    mic = os.environ.get("MC_SANDBOX_MICROPHONE") == "1"
+    discord = os.environ.get("MC_SANDBOX_DISCORD") == "1"
+    steam = os.environ.get("MC_SANDBOX_STEAM") == "1"
+
+    optional = []
+    if mic:
+        optional.append("(allow device-microphone)")
+    if discord:
+        optional.append(
+            """
+(allow network-outbound
+  (regex #"^/private/var/folders/.*/discord-ipc-[0-9]$")
+  (regex #"^/private/tmp/discord-ipc-[0-9]$"))
+""".strip()
+        )
+    if steam:
+        optional.append(
+            """
+(allow mach-lookup (global-name "com.valvesoftware.steam.ipctool"))
+(allow network-outbound
+  (regex #"^/private/tmp/steam_chrome_overlay_uid[0-9]+_spid[0-9]+$"))
+""".strip()
+        )
+
+    allow_lunar_account_read = (
+        os.environ.get("MC_SANDBOX_ALLOW_LUNAR_ACCOUNT_READ") == "1"
+        or (Path.home() / ".lunarclient" / ".mc-sandbox-allow-account-read").exists()
+    )
+    lunar_account_read_deny = "" if allow_lunar_account_read else f"""
+;; Lunar wants to create/chmod this file while booting. Allow writes through the
+;; settings/game write grant, but keep saved account contents unreadable by mods.
+(deny file-read-data
+  {literal(str(Path.home() / ".lunarclient" / "settings" / "game" / "accounts.json"))})"""
+
+    instance_controls = [
+        str(Path(inst_dir) / "instance.cfg"),
+        str(Path(inst_dir) / "mmc-pack.json"),
+    ]
+    protected_host_roots = [
+        *([f"{prism_root}/accounts.json", f"{prism_root}/prismlauncher.cfg", f"{prism_root}/accounts"] if prism_root else []),
+        str(Path.home() / "Library" / "Application Support" / "lunarclient" / "Cookies"),
+        str(Path.home() / "Library" / "Application Support" / "lunarclient" / "Trust Tokens"),
+        str(Path.home() / "Library" / "Application Support" / "lunarclient" / "Trust Tokens-journal"),
+        str(Path.home() / "Library" / "Application Support" / "lunarclient" / "Local Storage"),
+        str(Path.home() / ".ssh"),
+        str(Path.home() / ".gnupg"),
+        str(Path.home() / "Library" / "Keychains"),
+        str(Path.home() / "Library" / "Application Support" / "Google" / "Chrome"),
+        str(Path.home() / "Library" / "Application Support" / "Firefox"),
+        str(Path.home() / "Library" / "Application Support" / "BraveSoftware"),
+        str(Path.home() / "Library" / "Application Support" / "Discord"),
+    ]
+
+    return f"""
+(version 1)
+(deny default)
+(debug deny)
+(import "/System/Library/Sandbox/Profiles/bsd.sb")
+
+;; Process basics.
+(allow process-fork)
+(allow signal (target self))
+(allow sysctl-read)
+(allow file-read-metadata)
+
+;; Java may execute itself and helpers such as jspawnhelper.
+(allow process-exec
+{path_filters(exec_paths)})
+
+;; Minecraft instance and per-user temporary/cache writes.
+(allow file-read* file-write*
+{path_filters(read_write)})
+
+;; Java runtime, Prism shared game data, and system runtime files.
+(allow file-read*
+{path_filters(read_only)}
+  {literal(agent_path)}
+  {literal(str(Path.home() / ".CFUserTextEncoding"))})
+
+;; Trusted MCGuard components are never writable from the modded process.
+(deny file-write*
+  {literal(agent_path)}
+  {literal(broker_path)})
+
+;; A mod must not persistently disable the global wrapper or inject launch-time
+;; arguments/environment through Prism's per-instance control files.
+(deny file-write*
+{path_filters(instance_controls, kind="literal")}
+  {subpath(str(Path(inst_dir) / "patches"))})
+
+;; Keep Prism account/auth storage outside the game sandbox.
+(deny file-read* file-write*
+{path_filters(protected_host_roots)})
+
+{lunar_account_read_deny}
+
+;; Network and DNS for Minecraft, auth, downloads, servers, and mods.
+(allow network-outbound)
+(allow mach-lookup
+  (global-name "com.apple.networkd")
+  (global-name "com.apple.nsurlsessiond")
+  (global-name "com.apple.SystemConfiguration.configd")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.SystemConfiguration.NetworkInformation"))
+
+;; GUI, input, render, and macOS app services used by LWJGL/Qt/Java.
+(allow mach-register (local-name-prefix ""))
+(allow mach-lookup
+  (local-name "com.apple.CFPasteboardClient")
+  (local-name "com.apple.coredrag")
+  (global-name "com.apple.CARenderServer")
+  (global-name "com.apple.CoreDisplay.Notification")
+  (global-name "com.apple.CoreDisplay.master")
+  (global-name "com.apple.CoreServices.coreservicesd")
+  (global-name "com.apple.DiskArbitration.diskarbitrationd")
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name "com.apple.cvmsServ")
+  (global-name "com.apple.gpumemd.source")
+  (global-name "com.apple.gputools.service")
+  (global-name "com.apple.iohideventsystem")
+  (global-name "com.apple.lsd.mapdb")
+  (global-name "com.apple.pasteboard.1")
+  (global-name "com.apple.pbs.fetch_services")
+  (global-name "com.apple.tccd")
+  (global-name "com.apple.tccd.system")
+  (global-name "com.apple.tsm.uiserver")
+  (global-name "com.apple.window_proxies")
+  (global-name "com.apple.windowmanager.dragserver")
+  (global-name "com.apple.windowmanager.server")
+  (global-name "com.apple.windowserver.active")
+  (global-name-regex #"^com\\.apple\\.distributed_notifications"))
+
+(allow user-preference-read
+  (preference-domain "com.apple.Accessibility")
+  (preference-domain "com.apple.CoreGraphics")
+  (preference-domain "com.apple.HIToolbox")
+  (preference-domain "com.apple.avfoundation")
+  (preference-domain "com.apple.coreanimation")
+  (preference-domain "com.apple.coremedia")
+  (preference-domain "com.apple.corevideo")
+  (preference-domain "com.apple.gpu")
+  (preference-domain "com.apple.opengl")
+  (preference-domain "com.azul.zulu.java")
+  (preference-domain "com.nvidia.OpenGL")
+  (preference-domain "kCFPreferencesAnyApplication")
+  (preference-domain "kcfpreferencesanyapplication"))
+
+;; Audio and display shared memory.
+(allow ipc-posix-shm-read* ipc-posix-shm-write-data
+  (ipc-posix-name-prefix "AudioIO")
+  (ipc-posix-name-prefix "CFPBS:"))
+
+(allow ipc-posix-shm*
+  (ipc-posix-name "apple.shm.notification_center")
+  (ipc-posix-name "displayservices_shared")
+  (ipc-posix-name "com.apple.ColorSync.Gen.lock")
+  (ipc-posix-name "com.apple.ColorSync.Disp.lock")
+  (ipc-posix-name "com.apple.ColorSync.Gray2.2")
+  (ipc-posix-name "com.apple.ColorSync.sRGB")
+  (ipc-posix-name "com.apple.ColorSync.GenGray")
+  (ipc-posix-name "com.apple.ColorSync.GenRGB")
+  (ipc-posix-name-prefix "com.apple.cs."))
+
+(allow mach-lookup
+  (global-name "com.apple.audio.AudioComponentPrefs")
+  (global-name "com.apple.audio.AudioComponentRegistrar")
+  (global-name "com.apple.audio.AudioSession")
+  (global-name "com.apple.audio.SandboxHelper")
+  (global-name "com.apple.audio.SystemSoundServer-OSX")
+  (global-name "com.apple.audio.audiohald")
+  (global-name "com.apple.audio.coreaudiod")
+  (global-name "com.apple.audio.driver-registrar")
+  (global-name "com.apple.audioanalyticsd")
+  (global-name "com.apple.mediaexperience.endpoint.xpc")
+  (global-name "com.apple.audio.coreaudiod")
+  (global-name "com.apple.audio.audiohald"))
+
+;; OpenGL/Metal/IOSurface access. Minecraft needs this to create a real
+;; accelerated GLFW context; without it NeoForge reports no valid NSGL profile.
+(allow iokit-open
+  (iokit-registry-entry-class "AGPM")
+  (iokit-registry-entry-class "AppleGraphicsControl")
+  (iokit-registry-entry-class "AppleGraphicsPolicy")
+  (iokit-registry-entry-class "IOAccelerator")
+  (iokit-registry-entry-class "IOFramebuffer")
+  (iokit-registry-entry-class "IOSurfaceRoot")
+  (iokit-connection "AppleGraphicsDeviceControl")
+  (iokit-connection "IOAccelerator")
+  (iokit-user-client-class "AGPMClient")
+  (iokit-user-client-class "AppleGraphicsControlClient")
+  (iokit-user-client-class "AppleGraphicsDeviceControlClient")
+  (iokit-user-client-class "AppleGraphicsPolicyClient")
+  (iokit-user-client-class "AppleIntelMEUserClient")
+  (iokit-user-client-class "AppleMGPUPowerControlClient")
+  (iokit-user-client-class "AppleSNBFBUserClient")
+  (iokit-user-client-class "IOAccelCommandQueue")
+  (iokit-user-client-class "IOAccelContext")
+  (iokit-user-client-class "IOAccelContext2")
+  (iokit-user-client-class "IOAccelDevice")
+  (iokit-user-client-class "IOAccelDevice2")
+  (iokit-user-client-class "IOAccelSharedUserClient")
+  (iokit-user-client-class "IOAccelSharedUserClient2")
+  (iokit-user-client-class "IOAccelSubmitter2")
+  (iokit-user-client-class "IOAccelerationUserClient")
+  (iokit-user-client-class "IOAudioEngineUserClient")
+  (iokit-user-client-class "IOFramebufferSharedUserClient")
+  (iokit-user-client-class "IOGPUDeviceUserClient")
+  (iokit-user-client-class "IOSurfaceAcceleratorClient")
+  (iokit-user-client-class "IOSurfaceRootUserClient")
+  (iokit-user-client-class "IOSurfaceSendRight"))
+
+(allow iokit-get-properties
+  (iokit-property "IOGLESMetalBundleName")
+  (iokit-property "IOSurfaceAcceleratorCapabilitiesDict")
+  (iokit-property "MetalLimitersName")
+  (iokit-property "MetalPluginClassName")
+  (iokit-property "MetalPluginName")
+  (iokit-property "MetalStatisticsName")
+  (iokit-property "display-rotation")
+  (iokit-property "display-scale"))
+
+{chr(10).join(optional)}
+""".strip() + "\n"
+
+
+def main() -> int:
+    if not sys.argv[1:]:
+        print("mc-sandbox-wrapper: expected Prism to pass the Java command.", file=sys.stderr)
+        trace("error: wrapper was called without a Java command")
+        return 64
+
+    command = resolve_java_command(sys.argv[1:])
+    java_bin = command[0]
+    prism_protocol = b""
+    if is_prism_bootstrap(command):
+        prism_protocol, token, profile_uuid = protect_prism_protocol(sys.stdin.buffer)
+    elif looks_like_direct_game(command):
+        command, token, profile_uuid = protect_command(command)
+    else:
+        profile = profile_for(command)
+        with tempfile.NamedTemporaryFile("w", prefix="mc-game-sandbox-", suffix=".sb", delete=False) as fh:
+            fh.write(profile)
+            profile_path = fh.name
+        try:
+            return subprocess.call(
+                ["/usr/bin/sandbox-exec", "-f", profile_path, *command],
+                env=sanitized_environment(),
+            )
+        finally:
+            if os.environ.get("MC_SANDBOX_KEEP_PROFILE") != "1":
+                Path(profile_path).unlink(missing_ok=True)
+    try:
+        profile = profile_for(command)
+    except SystemExit as exc:
+        trace(f"error: {exc}")
+        raise
+    with tempfile.NamedTemporaryFile("w", prefix="mc-game-sandbox-", suffix=".sb", delete=False) as fh:
+        fh.write(profile)
+        profile_path = fh.name
+
+    trace(f"launch: java={java_bin} profile={profile_path} argc={len(command)}")
+    if os.environ.get("MC_SANDBOX_DEBUG") == "1":
+        print(f"mc-sandbox-wrapper: profile at {profile_path}", file=sys.stderr)
+
+    broker = trusted_component(BROKER, "MCGuard broker")
+    agent = trusted_component(AGENT, "MCGuard Java agent")
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_inheritable(read_fd, True)
+        os.write(write_fd, token.encode("utf-8", errors="strict"))
+    finally:
+        os.close(write_fd)
+
+    broker_args = [
+        broker,
+        "--token-fd", str(read_fd),
+        "--profile", profile_path,
+        "--agent", agent,
+        "--uuid", profile_uuid,
+    ]
+    protocol_read_fd = -1
+    if prism_protocol:
+        protocol_read_fd, protocol_write_fd = os.pipe()
+        try:
+            os.set_inheritable(protocol_read_fd, True)
+            written = 0
+            while written < len(prism_protocol):
+                written += os.write(protocol_write_fd, prism_protocol[written:])
+        finally:
+            os.close(protocol_write_fd)
+        broker_args.extend(["--stdin-fd", str(protocol_read_fd)])
+    if os.environ.get("MC_SANDBOX_KEEP_PROFILE") == "1":
+        broker_args.append("--keep-profile")
+    broker_args.extend(["--", *command])
+    clean_env = sanitized_environment()
+    trace(f"handoff: token-protection=on broker={broker} profile={profile_path}")
+    try:
+        os.execve(broker, broker_args, clean_env)
+    except OSError:
+        os.close(read_fd)
+        if protocol_read_fd >= 0:
+            os.close(protocol_read_fd)
+        Path(profile_path).unlink(missing_ok=True)
+        raise
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
