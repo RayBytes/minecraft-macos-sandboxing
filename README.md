@@ -25,6 +25,8 @@ libraries, temporary files, graphics, audio, and the network. It blocks Prism
 account files, browser data, SSH keys, Keychain files, and other common private
 data.
 
+To my knowledge, this is one of the first ways to block the minecraft JVM instance on MacOS from accessing a user's account session token.
+
 ## Requirements
 
 - macOS
